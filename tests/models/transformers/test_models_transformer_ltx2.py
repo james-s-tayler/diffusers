@@ -215,6 +215,169 @@ class LTX2TransformerTests(ModelTesterMixin, unittest.TestCase):
     #     self.assertTrue(torch.allclose(audio_generated_slice, audio_expected_slice, atol=1e-4))
 
 
+class LTX2VideoOnlyTransformerTests(unittest.TestCase):
+    """Tests for LTX2VideoTransformer3DModel in video-only mode (with_audio=False)."""
+
+    def _get_init_dict(self):
+        return {
+            "in_channels": 4,
+            "out_channels": 4,
+            "patch_size": 1,
+            "patch_size_t": 1,
+            "num_attention_heads": 2,
+            "attention_head_dim": 8,
+            "cross_attention_dim": 16,
+            "audio_in_channels": 4,
+            "audio_out_channels": 4,
+            "audio_num_attention_heads": 2,
+            "audio_attention_head_dim": 4,
+            "audio_cross_attention_dim": 8,
+            "num_layers": 2,
+            "qk_norm": "rms_norm_across_heads",
+            "caption_channels": 16,
+            "rope_double_precision": False,
+            "with_audio": False,
+        }
+
+    def _get_video_inputs(
+        self, batch_size=2, num_frames=2, height=16, width=16, num_channels=4, seq_len=16, emb_dim=16
+    ):
+        hidden_states = torch.randn((batch_size, num_frames * height * width, num_channels)).to(torch_device)
+        encoder_hidden_states = torch.randn((batch_size, seq_len, emb_dim)).to(torch_device)
+        encoder_attention_mask = torch.ones((batch_size, seq_len)).bool().to(torch_device)
+        timestep = torch.rand((batch_size,)).to(torch_device) * 1000
+        return {
+            "hidden_states": hidden_states,
+            "encoder_hidden_states": encoder_hidden_states,
+            "timestep": timestep,
+            "encoder_attention_mask": encoder_attention_mask,
+            "num_frames": num_frames,
+            "height": height,
+            "width": width,
+            "fps": 25.0,
+        }
+
+    def test_video_only_no_audio_parameters(self):
+        """When with_audio=False, no parameters should have 'audio_' in their name."""
+        model = LTX2VideoTransformer3DModel(**self._get_init_dict()).to(torch_device)
+        audio_params = [name for name, _ in model.named_parameters() if "audio_" in name]
+        self.assertEqual(
+            audio_params,
+            [],
+            f"Expected no audio parameters, but found: {audio_params}",
+        )
+
+    def test_video_only_no_audio_attributes(self):
+        """When with_audio=False, audio-specific module attributes should not exist."""
+        model = LTX2VideoTransformer3DModel(**self._get_init_dict()).to(torch_device)
+        audio_attrs = [
+            "audio_proj_in",
+            "audio_caption_projection",
+            "audio_time_embed",
+            "audio_rope",
+            "cross_attn_rope",
+            "cross_attn_audio_rope",
+            "audio_norm_out",
+            "audio_proj_out",
+            "audio_scale_shift_table",
+            "av_cross_attn_video_scale_shift",
+            "av_cross_attn_audio_scale_shift",
+            "av_cross_attn_video_a2v_gate",
+            "av_cross_attn_audio_v2a_gate",
+        ]
+        for attr in audio_attrs:
+            self.assertFalse(
+                hasattr(model, attr),
+                f"Expected model to NOT have attribute '{attr}' in video-only mode, but it does.",
+            )
+
+    def test_video_only_forward_output_shape(self):
+        """forward() with only video inputs should return the correct output shape."""
+        init_dict = self._get_init_dict()
+        num_channels = init_dict["in_channels"]
+        model = LTX2VideoTransformer3DModel(**init_dict).to(torch_device)
+        model.eval()
+
+        batch_size = 2
+        num_frames, height, width = 2, 16, 16
+        inputs = self._get_video_inputs(
+            batch_size=batch_size,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            num_channels=num_channels,
+        )
+        with torch.no_grad():
+            output = model(**inputs)
+
+        expected_shape = (batch_size, num_frames * height * width, num_channels)
+        self.assertEqual(output.sample.shape, expected_shape)
+        self.assertIsNone(output.audio_sample)
+
+    def test_video_only_forward_tuple_output(self):
+        """forward() with return_dict=False should return a tuple with only the video output."""
+        init_dict = self._get_init_dict()
+        num_channels = init_dict["in_channels"]
+        model = LTX2VideoTransformer3DModel(**init_dict).to(torch_device)
+        model.eval()
+
+        num_frames, height, width = 2, 16, 16
+        inputs = self._get_video_inputs(num_frames=num_frames, height=height, width=width, num_channels=num_channels)
+        inputs["return_dict"] = False
+        with torch.no_grad():
+            output = model(**inputs)
+
+        self.assertIsInstance(output, tuple)
+        self.assertEqual(len(output), 1)
+
+    def test_with_audio_true_unchanged(self):
+        """with_audio=True (default) should still work and produce both video and audio outputs."""
+        init_dict = self._get_init_dict()
+        init_dict["with_audio"] = True
+        num_channels = init_dict["in_channels"]
+        model = LTX2VideoTransformer3DModel(**init_dict).to(torch_device)
+        model.eval()
+
+        batch_size = 2
+        num_frames, height, width = 2, 16, 16
+        audio_num_frames = 9
+        audio_num_channels, num_mel_bins = 2, 2
+        seq_len, emb_dim = 16, 16
+
+        inputs = {
+            "hidden_states": torch.randn((batch_size, num_frames * height * width, num_channels)).to(torch_device),
+            "audio_hidden_states": torch.randn(
+                (batch_size, audio_num_frames, audio_num_channels * num_mel_bins)
+            ).to(torch_device),
+            "encoder_hidden_states": torch.randn((batch_size, seq_len, emb_dim)).to(torch_device),
+            "audio_encoder_hidden_states": torch.randn((batch_size, seq_len, emb_dim)).to(torch_device),
+            "timestep": torch.rand((batch_size,)).to(torch_device) * 1000,
+            "encoder_attention_mask": torch.ones((batch_size, seq_len)).bool().to(torch_device),
+            "num_frames": num_frames,
+            "height": height,
+            "width": width,
+            "audio_num_frames": audio_num_frames,
+            "fps": 25.0,
+        }
+        with torch.no_grad():
+            output = model(**inputs)
+
+        self.assertIsNotNone(output.sample)
+        self.assertIsNotNone(output.audio_sample)
+        expected_video_shape = (batch_size, num_frames * height * width, num_channels)
+        self.assertEqual(output.sample.shape, expected_video_shape)
+
+    def test_video_only_config_registered(self):
+        """with_audio flag should be stored in the model config."""
+        model = LTX2VideoTransformer3DModel(**self._get_init_dict())
+        self.assertFalse(model.config.with_audio)
+
+        av_init_dict = self._get_init_dict()
+        av_init_dict["with_audio"] = True
+        av_model = LTX2VideoTransformer3DModel(**av_init_dict)
+        self.assertTrue(av_model.config.with_audio)
+
+
 class LTX2TransformerCompileTests(TorchCompileTesterMixin, unittest.TestCase):
     model_class = LTX2VideoTransformer3DModel
 
